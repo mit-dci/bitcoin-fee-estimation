@@ -105,8 +105,7 @@ COLUMN_DESCRIPTIONS = {
     # Engineered features
     "fee_rate_percentile": "Tie-aware within-epoch fee rate percentile (priority, 0-1)",
     "impatience": "Impatience proxy: 1 / (min_respend_blocks + eps), truncated",
-    "cumulative_weight": "Cumulative weight of txs in the block up to this tx",
-    "blockspace_utilization": "Fraction of max block weight used (cumulative_weight / 4M WU)",
+    "blockspace_utilization": "Fraction of max block weight used (block_weight / 4M WU), broadcast per block",
 
     # Log transforms
     "log_fee_rate": "log(1 + fee_rate)",
@@ -167,6 +166,23 @@ def load_corrected_weights(
             fee     AS fee_corrected,
             fee_rate AS fee_rate_corrected
         FROM transactions
+        """,
+        conn,
+    )
+    conn.close()
+    return df
+
+
+def load_block_weights(
+    mempool_space_db: str = DEFAULT_MEMPOOL_SPACE_DB,
+) -> pd.DataFrame:
+    conn = sqlite3.connect(mempool_space_db)
+    df = pd.read_sql_query(
+        """
+        SELECT block_hash AS conf_block_hash,
+               SUM(weight) AS block_weight
+        FROM transactions
+        GROUP BY block_hash
         """,
         conn,
     )
@@ -262,6 +278,21 @@ def load_data_from_sqlite(
     logger.info(
         "Loaded %d transactions — %d with corrected weights (%.1f%%)",
         len(df), corrected_count, 100 * corrected_count / len(df),
+    )
+
+    logger.info("Merging per-block weight totals from mempool.space...")
+    block_weights = load_block_weights(mempool_space_db)
+    n_before = df["conf_block_hash"].nunique()
+    df = df.merge(block_weights, on="conf_block_hash", how="left")
+    n_missing = df["block_weight"].isna().sum()
+    if n_missing:
+        logger.warning(
+            "%d transactions across %d blocks lack a block_weight from mempool.space",
+            n_missing, df.loc[df["block_weight"].isna(), "conf_block_hash"].nunique(),
+        )
+    logger.info(
+        "Block weights merged for %d / %d distinct blocks",
+        df.loc[df["block_weight"].notna(), "conf_block_hash"].nunique(), n_before,
     )
     return df
 
@@ -589,6 +620,10 @@ def compute_impatience_proxy(
     logger.info("Computing impatience proxy...")
     df["min_respend_blocks"] = df["min_respend_blocks"].fillna(-1)
     valid_respend = df["min_respend_blocks"] >= 0
+    if not valid_respend.any():
+        logger.info("No rows with valid min_respend_blocks; setting impatience=0.0 for all rows")
+        df["impatience"] = 0.0
+        return df
     respend_truncated = df["min_respend_blocks"].clip(upper=truncation_blocks)
     df["impatience"] = np.nan
     df.loc[valid_respend, "impatience"] = 1 / (respend_truncated.loc[valid_respend] + epsilon)
@@ -599,9 +634,13 @@ def compute_impatience_proxy(
 
 def compute_blockspace_utilization(df: pd.DataFrame, max_block_weight: int) -> pd.DataFrame:
     logger.info("Computing blockspace utilization...")
-    df = df.sort_values(["conf_block_hash", "found_at"]).copy()
-    df["cumulative_weight"]      = df.groupby("conf_block_hash")["weight"].cumsum()
-    df["blockspace_utilization"] = (df["cumulative_weight"] / max_block_weight).clip(0, 1)
+    if "block_weight" not in df.columns:
+        raise KeyError(
+            "block_weight column missing — load_data_from_sqlite must merge per-block "
+            "weight totals from mempool.space before feature preparation."
+        )
+    df = df.copy()
+    df["blockspace_utilization"] = (df["block_weight"] / max_block_weight).clip(upper=1.0)
     return df
 
 
@@ -620,7 +659,8 @@ def create_derived_features(df: pd.DataFrame) -> pd.DataFrame:
         df["log_block_p90_feerate"]      = np.log1p(df["block_p90_feerate"])
         df["log_ema_feerate_3block"]     = np.log1p(df["ema_feerate_3block"])
         df["log_time_since_last_block"]  = np.log1p(df["time_since_last_block"].clip(lower=0))
-        df["log_tx_arrival_rate_10m"]    = np.log1p(df["tx_arrival_rate_10m"].fillna(0))
+        if "tx_arrival_rate_10m" in df.columns:
+            df["log_tx_arrival_rate_10m"] = np.log1p(df["tx_arrival_rate_10m"].fillna(0))
 
     df["has_rbf"] = (df["rbf_fee_total"].notna() & (df["rbf_fee_total"] > 0)).astype(int)
 
@@ -697,9 +737,28 @@ def export_dataset(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    df.to_parquet(output_path, index=False, engine="pyarrow", compression="snappy")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    chunk_size = 500_000
+    n_rows = len(df)
+    writer = None
+    try:
+        for start in range(0, n_rows, chunk_size):
+            end = min(start + chunk_size, n_rows)
+            table = pa.Table.from_pandas(
+                df.iloc[start:end], preserve_index=False, safe=False,
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(output_path, table.schema, compression="snappy")
+            writer.write_table(table)
+            del table
+            logger.info("  parquet wrote %s / %s rows", f"{end:,}", f"{n_rows:,}")
+    finally:
+        if writer is not None:
+            writer.close()
     size_mb = output_path.stat().st_size / 1e6
-    logger.info("Dataset exported: %s (%d rows, %.1f MB)", output_path, len(df), size_mb)
+    logger.info("Dataset exported: %s (%d rows, %.1f MB)", output_path, n_rows, size_mb)
 
     if write_metadata:
         metadata = {

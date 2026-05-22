@@ -44,7 +44,7 @@ from scipy import sparse, stats
 from scipy.interpolate import BSpline, interp1d
 from scipy.optimize import lsq_linear, minimize
 
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import mean_squared_error, r2_score
@@ -206,6 +206,11 @@ class DelayTechnologyEstimator:
         self._is_fitted   = False
         self._valid_indices = None
         self._model_label = None
+        # Real quantile heads — populated during fit(). Consumed by the
+        # serving Predictor (realtime_fee_estimator/.../predictor.py) to
+        # replace the synthetic ±zσ band with proper P50/P80/P95 surfaces.
+        # Keys are quantile levels (alpha); values are fitted regressors.
+        self.quantile_heads: Optional[Dict[float, "HistGradientBoostingRegressor"]] = None
 
     def _build_stage1_model(self):
         """Construct the configured Stage 1 learner."""
@@ -280,9 +285,54 @@ class DelayTechnologyEstimator:
             ):
                 logger.info("  %-25s %.4f", feat, imp)
 
+        self._fit_quantile_heads(X_train, y_train, X_test, y_test)
+
         self._is_fitted = True
         self._r2_test   = r2_test
         return self
+
+    def _fit_quantile_heads(
+        self, X_train: np.ndarray, y_train: np.ndarray,
+        X_test: np.ndarray, y_test: np.ndarray,
+    ) -> None:
+        """Fit P50/P80/P95 quantile regressors on the same X/y as Stage 1.
+
+        These replace the homoscedastic ±zσ band synthesized in the serving
+        layer. Monotonicity in `fee_rate_percentile` (column 0) is required
+        so the serving-side bisection over fee remains well-posed against
+        the quantile surface — a non-monotone P95 would let a higher fee
+        produce a *worse* tail bound, which the bisection cannot handle.
+        """
+        logger.info("Fitting quantile heads at α ∈ {0.5, 0.8, 0.95}...")
+        # column 0 is fee_rate_percentile — higher percentile = shorter wait,
+        # so the constraint is decreasing (-1). Other features unconstrained.
+        monotonic_cst = [-1, 0, 0, 0]
+        heads: Dict[float, HistGradientBoostingRegressor] = {}
+        for alpha in (0.5, 0.8, 0.95):
+            head = HistGradientBoostingRegressor(
+                loss="quantile",
+                quantile=alpha,
+                max_iter=300,
+                max_depth=6,
+                learning_rate=0.05,
+                min_samples_leaf=50,
+                monotonic_cst=monotonic_cst,
+                random_state=42,
+            )
+            head.fit(X_train, y_train)
+            preds = head.predict(X_test)
+            # Pinball loss — lower is better; symmetric weighting around α.
+            diff = y_test - preds
+            pinball = np.mean(np.maximum(alpha * diff, (alpha - 1) * diff))
+            # Empirical coverage — fraction of held-out y_test below predicted Pα.
+            # Should approach α if the head is well-calibrated.
+            coverage = float((y_test <= preds).mean())
+            logger.info(
+                "  P%02d  pinball=%.4f  coverage=%.3f (target=%.2f)",
+                int(alpha * 100), pinball, coverage, alpha,
+            )
+            heads[alpha] = head
+        self.quantile_heads = heads
 
     def predict_W_hat(self, df: pd.DataFrame) -> np.ndarray:
         if not self._is_fitted:
@@ -693,7 +743,7 @@ def compute_impatience_spline_effect(stage2, df: pd.DataFrame, n_grid: int = 300
 # ---------------------------------------------------------------------------
 
 class HurdleFeeModel:
-    """Stage 2: Fee model with monotone I-spline impatience effect and epoch FE."""
+    """Stage 2: Fee model with linear impatience term and epoch FE."""
 
     CONTROL_FEATURES = [
         "log_Wprime",
@@ -727,41 +777,24 @@ class HurdleFeeModel:
         self._n_epoch_dummies = 0
         self._feature_names   = None
         self._trim_threshold  = None
+        # Kept for backwards-compat with diagnostic helpers that guard on these
+        # attributes (e.g., compute_impatience_spline_effect). Always None now
+        # that impatience enters the model linearly.
         self._impatience_spline = None
         self._impatience_clip = None
-        self._ispline_col_start = None
-        self._n_ispline_basis = 0
         self._is_fitted = False
 
     def _build_feature_matrix(
         self, df: pd.DataFrame, fit_spline: bool = False
     ) -> Tuple[Any, List[str]]:
-        linear_dense = np.hstack([df[self.CONTROL_FEATURES].values, df[self.STATE_FEATURES].values])
-        feature_names = list(self.CONTROL_FEATURES) + list(self.STATE_FEATURES)
-
-        imp_raw = df[["impatience"]].values
-        if fit_spline:
-            lo, hi = np.percentile(imp_raw, [1, 99])
-            self._impatience_clip = (float(lo), float(hi))
-            imp_clipped = np.clip(imp_raw, lo, hi)
-            self._impatience_spline = ISplineTransformer(
-                n_knots=IMPATIENCE_SPLINE_N_KNOTS,
-                degree=IMPATIENCE_SPLINE_DEGREE,
-            )
-            imp_basis = self._impatience_spline.fit_transform(imp_clipped)
-            self._ispline_col_start = len(feature_names)
-            self._n_ispline_basis = imp_basis.shape[1]
-            logger.info(
-                "Impatience I-spline: %d basis functions (clip=[%.4g, %.4g])",
-                self._n_ispline_basis, lo, hi,
-            )
-        else:
-            imp_clipped = np.clip(imp_raw, *self._impatience_clip)
-            imp_basis = self._impatience_spline.transform(imp_clipped)
-
-        imp_names = [f"impatience_spl_{i}" for i in range(imp_basis.shape[1])]
-        feature_names += imp_names
-        X_dense = np.hstack([linear_dense, imp_basis])
+        # fit_spline is retained for call-site compatibility but no longer
+        # affects feature construction (impatience enters linearly).
+        X_dense = np.hstack([
+            df[self.CONTROL_FEATURES].values,
+            df[self.STATE_FEATURES].values,
+            df[["impatience"]].values,
+        ])
+        feature_names = list(self.CONTROL_FEATURES) + list(self.STATE_FEATURES) + ["impatience"]
 
         if self.use_epoch_fe:
             if fit_spline:
@@ -792,16 +825,6 @@ class HurdleFeeModel:
             X = X_dense
 
         return X, feature_names
-
-    def _make_coef_bounds(self, n_total: int) -> list:
-        """Constrain I-spline coefficients to be nonnegative."""
-        bounds = [(None, None)] * n_total
-        if self._ispline_col_start is None or self._n_ispline_basis == 0:
-            return bounds
-        start = self._ispline_col_start + 1
-        for j in range(self._n_ispline_basis):
-            bounds[start + j] = (0.0, None)
-        return bounds
 
     def fit(self, df: pd.DataFrame) -> "HurdleFeeModel":
         logger.info("=" * 60)
@@ -846,9 +869,6 @@ class HurdleFeeModel:
 
         X, self._feature_names = self._build_feature_matrix(df_valid, fit_spline=True)
         logger.info("Feature matrix shape: %s", X.shape)
-        coef_bounds = self._make_coef_bounds(X.shape[1] + 1)
-        n_nonneg = sum(1 for lo, _ in coef_bounds if lo is not None and lo >= 0)
-        logger.info("Monotonicity bounds: %d I-spline coefficients constrained >= 0", n_nonneg)
 
         # Intensive margin on all transactions with positive fee_rate
         y_int = np.log(df_valid["fee_rate"].values)
@@ -868,11 +888,9 @@ class HurdleFeeModel:
             X_int = _prepend_intercept(X_int_raw)
             if self.use_ridge:
                 logger.info("  Using Ridge (alpha=%.2f)", self.ridge_alpha)
-                self.int_coefs = fit_regularized_ols(
-                    X_int, y_int, alpha=self.ridge_alpha, bounds=coef_bounds
-                )
+                self.int_coefs = fit_regularized_ols(X_int, y_int, alpha=self.ridge_alpha)
             else:
-                self.int_coefs = fit_regularized_ols(X_int, y_int, alpha=0.0, bounds=coef_bounds)
+                self.int_coefs = fit_regularized_ols(X_int, y_int, alpha=0.0)
 
         X_int_with_intercept = _prepend_intercept(X_int_raw)
         y_pred_int = X_int_with_intercept @ self.int_coefs
@@ -967,7 +985,9 @@ class BitcoinFeeEstimator:
         self.df_prepared.loc[self.stage1._valid_indices, "W_hat"]      = W_hat
         self.df_prepared.loc[self.stage1._valid_indices, "W_monotone"] = W_monotone
         self.df_prepared.loc[self.stage1._valid_indices, "Wprime_hat"] = Wprime_hat
-        self.df_prepared["log_Wprime"] = np.log(
+        # Sign convention: log_Wprime = -log(|W'|) = log(1/|W'|), the log
+        # marginal priority cost per unit delay reduction (positive when |W'|<1).
+        self.df_prepared["log_Wprime"] = -np.log(
             self.df_prepared["Wprime_hat"].clip(lower=1e-6)
         )
 
@@ -998,7 +1018,7 @@ class BitcoinFeeEstimator:
             df.loc[self.stage1._valid_indices, "W_hat"]      = W_hat
             df.loc[self.stage1._valid_indices, "W_monotone"] = W_monotone
             df.loc[self.stage1._valid_indices, "Wprime_hat"] = Wprime_hat
-            df["log_Wprime"] = np.log(df["Wprime_hat"].clip(lower=1e-6))
+            df["log_Wprime"] = -np.log(df["Wprime_hat"].clip(lower=1e-6))
 
         valid_mask = df["log_Wprime"].notna()
         df_valid   = df[valid_mask].copy()
@@ -1041,8 +1061,6 @@ class BitcoinFeeEstimator:
             "stage2": {
                 "smearing_factor": self.stage2.smearing_factor,
                 "n_features":      len(self.stage2._feature_names),
-                "n_impatience_spline_basis": self.stage2._n_ispline_basis,
-                "impatience_clip": self.stage2._impatience_clip,
             },
         }
 
@@ -1769,7 +1787,7 @@ def main() -> None:
     df.loc[stage1._valid_indices, "W_hat"]      = W_hat
     df.loc[stage1._valid_indices, "W_monotone"] = W_monotone
     df.loc[stage1._valid_indices, "Wprime_hat"] = Wprime_hat
-    df["log_Wprime"] = np.log(df["Wprime_hat"].clip(lower=1e-6))
+    df["log_Wprime"] = -np.log(df["Wprime_hat"].clip(lower=1e-6))
 
     # ------------------------------------------------------------------
     # Step 3: Stage 2 — always fit (fast)

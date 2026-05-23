@@ -15,6 +15,12 @@ Stage 2 (Fee Equation)        Spline regression:
                               with epoch-clustered standard errors
 ```
 
+## Data
+
+The pre-built dataset and the raw mempool.space transaction dump are published on Kaggle:
+[kristianpraizner/mempool-space-data](https://www.kaggle.com/datasets/kristianpraizner/mempool-space-data).
+Download and place the files under `data/` (or pass an explicit path via `--dataset`).
+
 ## Quickstart
 
 ```bash
